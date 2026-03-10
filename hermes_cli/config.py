@@ -77,6 +77,10 @@ DEFAULT_CONFIG = {
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
         "container_persistent": True,   # Persist filesystem across sessions
+        # Docker volume mounts — share host directories with the container.
+        # Each entry is "host_path:container_path" (standard Docker -v syntax).
+        # Example: ["/home/user/projects:/workspace/projects", "/data:/data"]
+        "docker_volumes": [],
     },
     
     "browser": {
@@ -401,14 +405,18 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
     },
     "SLACK_BOT_TOKEN": {
-        "description": "Slack bot integration",
+        "description": "Slack bot token (xoxb-). Get from OAuth & Permissions after installing your app. "
+                       "Required scopes: chat:write, app_mentions:read, channels:history, groups:history, "
+                       "im:history, im:read, im:write, users:read, files:write",
         "prompt": "Slack Bot Token (xoxb-...)",
         "url": "https://api.slack.com/apps",
         "password": True,
         "category": "messaging",
     },
     "SLACK_APP_TOKEN": {
-        "description": "Slack Socket Mode connection",
+        "description": "Slack app-level token (xapp-) for Socket Mode. Get from Basic Information → "
+                       "App-Level Tokens. Also ensure Event Subscriptions include: message.im, "
+                       "message.channels, message.groups, app_mention",
         "prompt": "Slack App Token (xapp-...)",
         "url": "https://api.slack.com/apps",
         "password": True,
