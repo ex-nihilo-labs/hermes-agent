@@ -782,6 +782,42 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    # Gemini — dual-mode: API key (env var) takes priority, then OAuth file
+    if provider == "gemini":
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        if pconfig:
+            try:
+                creds = resolve_api_key_provider_credentials(provider)
+                if creds.get("api_key"):
+                    return {
+                        "provider": "gemini",
+                        "api_mode": "chat_completions",
+                        "base_url": creds.get("base_url", "").rstrip("/"),
+                        "api_key": creds["api_key"],
+                        "source": creds.get("source", "env"),
+                        "requested_provider": requested_provider,
+                    }
+            except Exception:
+                pass  # No API key — fall through to OAuth
+            try:
+                from agent.google_oauth import resolve_gemini_oauth_token
+                oauth_token = resolve_gemini_oauth_token()
+                if oauth_token:
+                    base_url = (
+                        os.getenv("GEMINI_BASE_URL", "").strip().rstrip("/")
+                        or pconfig.inference_base_url
+                    )
+                    return {
+                        "provider": "gemini",
+                        "api_mode": "chat_completions",
+                        "base_url": base_url,
+                        "api_key": oauth_token,
+                        "source": "gemini_oauth",
+                        "requested_provider": requested_provider,
+                    }
+            except Exception as exc:
+                logger.debug("Gemini OAuth resolution failed: %s", exc)
+
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
