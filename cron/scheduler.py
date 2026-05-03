@@ -1365,7 +1365,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                auth_failure = bool(error) and any(s in error.lower() for s in (
+                    "anthropic credential", "autherror", "no available entries",
+                    "credentials found", "claude /login", "claude setup-token",
+                ))
+                if not success and auth_failure:
+                    logger.warning("Job '%s': auth failure suppressed from delivery — %s", job["id"], error)
+                    should_deliver = False
+                elif should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 
