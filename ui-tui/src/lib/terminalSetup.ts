@@ -25,14 +25,23 @@ export type TerminalSetupResult = {
 }
 
 const DEFAULT_FILE_OPS: FileOps = { copyFile, mkdir, readFile, writeFile }
+const COPY_SEQUENCE = '\u001b[99;13u'
 const MULTILINE_SEQUENCE = '\\\r\n'
+
 const TERMINAL_META: Record<SupportedTerminal, { appName: string; label: string }> = {
   vscode: { appName: 'Code', label: 'VS Code' },
   cursor: { appName: 'Cursor', label: 'Cursor' },
   windsurf: { appName: 'Windsurf', label: 'Windsurf' }
 }
 
-const TARGET_BINDINGS: Keybinding[] = [
+const MAC_COPY_BINDING: Keybinding = {
+  key: 'cmd+c',
+  command: 'workbench.action.terminal.sendSequence',
+  when: 'terminalFocus && terminalTextSelected',
+  args: { text: COPY_SEQUENCE }
+}
+
+const BASE_BINDINGS: Keybinding[] = [
   {
     key: 'shift+enter',
     command: 'workbench.action.terminal.sendSequence',
@@ -64,6 +73,9 @@ const TARGET_BINDINGS: Keybinding[] = [
     args: { text: '\u001b[122;10u' }
   }
 ]
+
+const targetBindings = (platform: NodeJS.Platform): Keybinding[] =>
+  platform === 'darwin' ? [MAC_COPY_BINDING, ...BASE_BINDINGS] : BASE_BINDINGS
 
 export function detectVSCodeLikeTerminal(env: NodeJS.ProcessEnv = process.env): null | SupportedTerminal {
   const askpass = env['VSCODE_GIT_ASKPASS_MAIN']?.toLowerCase() ?? ''
@@ -99,18 +111,22 @@ export function stripJsonComments(content: string): string {
     // String literal — copy as-is, including any comment-like chars inside
     if (ch === '"') {
       let j = i + 1
+
       while (j < len) {
         if (content[j] === '\\') {
           j += 2 // skip escaped char
         } else if (content[j] === '"') {
           j++
+
           break
         } else {
           j++
         }
       }
+
       result += content.slice(i, j)
       i = j
+
       continue
     }
 
@@ -118,6 +134,7 @@ export function stripJsonComments(content: string): string {
     if (ch === '/' && content[i + 1] === '/') {
       const eol = content.indexOf('\n', i)
       i = eol === -1 ? len : eol
+
       continue
     }
 
@@ -125,6 +142,7 @@ export function stripJsonComments(content: string): string {
     if (ch === '/' && content[i + 1] === '*') {
       const end = content.indexOf('*/', i + 2)
       i = end === -1 ? len : end + 2
+
       continue
     }
 
@@ -163,6 +181,90 @@ function isKeybinding(value: unknown): value is Keybinding {
 
 function sameBinding(a: Keybinding, b: Keybinding): boolean {
   return a.key === b.key && a.command === b.command && a.when === b.when && a.args?.text === b.args?.text
+}
+
+type WhenRequirements = {
+  forbidden: Set<string>
+  required: Set<string>
+}
+
+const WHEN_TOKEN_RE = /!?[A-Za-z_][\w.]*/g
+
+function parseWhenRequirements(when: string): WhenRequirements {
+  const required = new Set<string>()
+  const forbidden = new Set<string>()
+
+  for (const [token] of when.matchAll(WHEN_TOKEN_RE)) {
+    if (token.startsWith('!')) {
+      forbidden.add(token.slice(1))
+    } else {
+      required.add(token)
+    }
+  }
+
+  return { forbidden, required }
+}
+
+function requirementsContradict(a: WhenRequirements, b: WhenRequirements): boolean {
+  for (const token of a.required) {
+    if (b.forbidden.has(token)) {
+      return true
+    }
+  }
+
+  for (const token of b.required) {
+    if (a.forbidden.has(token)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function whensOverlap(a: string, b: string): boolean {
+  if (a === b) {
+    return true
+  }
+
+  // Empty when = global, overlaps every context.
+  if (!a || !b) {
+    return true
+  }
+
+  const left = parseWhenRequirements(a)
+  const right = parseWhenRequirements(b)
+
+  if (requirementsContradict(left, right)) {
+    return false
+  }
+
+  // This intentionally avoids a full VS Code when-clause parser. If two
+  // same-key bindings share a positive context token and don't explicitly
+  // contradict each other, they can fire together in that context.
+  for (const token of left.required) {
+    if (right.required.has(token)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+// VS Code allows multiple bindings on the same key as long as their `when`
+// clauses don't overlap. We flag a conflict when the contexts overlap but
+// the bindings differ — e.g. existing `terminalFocus` cmd+c overlaps with
+// our `terminalFocus && terminalTextSelected`, so the existing binding
+// would shadow ours when text isn't selected.
+function bindingsConflict(existing: Keybinding, target: Keybinding): boolean {
+  if (existing.key !== target.key) {
+    return false
+  }
+
+  if (!whensOverlap(existing.when ?? '', target.when ?? '')) {
+    return false
+  }
+
+  return !sameBinding(existing, target)
 }
 
 async function backupFile(filePath: string, ops: FileOps): Promise<void> {
@@ -208,19 +310,23 @@ export async function configureTerminalKeybindings(
 
     let keybindings: unknown[] = []
     let hasExistingFile = false
+
     try {
       const content = await ops.readFile(keybindingsFile, 'utf8')
       hasExistingFile = true
       const parsed: unknown = JSON.parse(stripJsonComments(content))
+
       if (!Array.isArray(parsed)) {
         return {
           success: false,
           message: `${meta.label} keybindings.json is not a JSON array: ${keybindingsFile}`
         }
       }
+
       keybindings = parsed
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code
+
       if (code !== 'ENOENT') {
         return {
           success: false,
@@ -229,8 +335,10 @@ export async function configureTerminalKeybindings(
       }
     }
 
-    const conflicts = TARGET_BINDINGS.filter(target =>
-      keybindings.some(existing => isKeybinding(existing) && existing.key === target.key && !sameBinding(existing, target))
+    const targets = targetBindings(platform)
+
+    const conflicts = targets.filter(target =>
+      keybindings.some(existing => isKeybinding(existing) && bindingsConflict(existing, target))
     )
 
     if (conflicts.length) {
@@ -242,8 +350,10 @@ export async function configureTerminalKeybindings(
     }
 
     let added = 0
-    for (const target of TARGET_BINDINGS.slice().reverse()) {
+
+    for (const target of targets.slice().reverse()) {
       const exists = keybindings.some(existing => isKeybinding(existing) && sameBinding(existing, target))
+
       if (!exists) {
         keybindings.unshift(target)
         added += 1
@@ -320,11 +430,14 @@ export async function shouldPromptForTerminalSetup(options?: {
   try {
     const content = await ops.readFile(join(configDir, 'keybindings.json'), 'utf8')
     const parsed: unknown = JSON.parse(stripJsonComments(content))
+
     if (!Array.isArray(parsed)) {
       return true
     }
 
-    return TARGET_BINDINGS.some(target => !parsed.some(existing => isKeybinding(existing) && sameBinding(existing, target)))
+    return targetBindings(platform).some(
+      target => !parsed.some(existing => isKeybinding(existing) && sameBinding(existing, target))
+    )
   } catch {
     return true
   }

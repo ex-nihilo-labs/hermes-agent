@@ -3,20 +3,21 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { useStdin, withInkSuspended } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { useCallback, useMemo, useState } from 'react'
-import { useStdin } from '@hermes/ink'
 
 import type { PasteEvent } from '../components/textInput.js'
 import { LARGE_PASTE } from '../config/limits.js'
+import type { ImageAttachResponse, InputDetectDropResponse } from '../gatewayTypes.js'
 import { useCompletion } from '../hooks/useCompletion.js'
 import { useInputHistory } from '../hooks/useInputHistory.js'
 import { useQueue } from '../hooks/useQueue.js'
 import { isUsableClipboardText, readClipboardText } from '../lib/clipboard.js'
+import { resolveEditor } from '../lib/editor.js'
 import { readOsc52Clipboard } from '../lib/osc52.js'
 import { isRemoteShellSession } from '../lib/terminalSetup.js'
 import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
-import type { ImageAttachResponse, InputDetectDropResponse } from '../gatewayTypes.js'
 
 import type { MaybePromise, PasteSnippet, UseComposerStateOptions, UseComposerStateResult } from './interfaces.js'
 import { $isBlocked } from './overlayStore.js'
@@ -79,8 +80,8 @@ export function looksLikeDroppedPath(text: string): boolean {
     trimmed.startsWith("'/") ||
     trimmed.startsWith('"~') ||
     trimmed.startsWith("'~") ||
-    (/^[A-Za-z]:[/\\]/.test(trimmed)) ||
-    (/^["'][A-Za-z]:[/\\]/.test(trimmed))
+    /^[A-Za-z]:[/\\]/.test(trimmed) ||
+    /^["'][A-Za-z]:[/\\]/.test(trimmed)
   ) {
     return true
   }
@@ -90,21 +91,37 @@ export function looksLikeDroppedPath(text: string): boolean {
   // unnecessary RPC round-trips.
   if (trimmed.startsWith('/')) {
     const rest = trimmed.slice(1)
+
     return rest.includes('/') || rest.includes('.')
   }
 
   return false
 }
 
-export function useComposerState({ gw, onClipboardPaste, onImageAttached, submitRef }: UseComposerStateOptions): UseComposerStateResult {
+export function useComposerState({
+  gw,
+  onClipboardPaste,
+  onImageAttached,
+  submitRef
+}: UseComposerStateOptions): UseComposerStateResult {
   const [input, setInput] = useState('')
   const [inputBuf, setInputBuf] = useState<string[]>([])
   const [pasteSnips, setPasteSnips] = useState<PasteSnippet[]>([])
   const isBlocked = useStore($isBlocked)
   const { querier } = useStdin() as { querier: Parameters<typeof readOsc52Clipboard>[0] }
 
-  const { queueRef, queueEditRef, queuedDisplay, queueEditIdx, enqueue, dequeue, replaceQ, setQueueEdit, syncQueue } =
-    useQueue()
+  const {
+    queueRef,
+    queueEditRef,
+    queuedDisplay,
+    queueEditIdx,
+    enqueue,
+    dequeue,
+    removeQ,
+    replaceQ,
+    setQueueEdit,
+    syncQueue
+  } = useQueue()
 
   const { historyRef, historyIdx, setHistoryIdx, historyDraftRef, pushHistory } = useInputHistory()
   const { completions, compIdx, setCompIdx, compReplace } = useCompletion(input, isBlocked, gw)
@@ -119,7 +136,12 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
   }, [historyDraftRef, setQueueEdit, setHistoryIdx])
 
   const handleResolvedPaste = useCallback(
-    async ({ bracketed, cursor, text, value }: Omit<PasteEvent, 'hotkey'>): Promise<null | { cursor: number; value: string }> => {
+    async ({
+      bracketed,
+      cursor,
+      text,
+      value
+    }: Omit<PasteEvent, 'hotkey'>): Promise<null | { cursor: number; value: string }> => {
       const cleanedText = stripTrailingPasteNewlines(text)
 
       if (!cleanedText || !/[^\n]/.test(cleanedText)) {
@@ -131,6 +153,7 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
       }
 
       const sid = getUiState().sid
+
       if (sid && looksLikeDroppedPath(cleanedText)) {
         try {
           const attached = await gw.request<ImageAttachResponse>('image.attach', {
@@ -141,6 +164,7 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
           if (attached?.name) {
             onImageAttached?.(attached)
             const remainder = attached.remainder?.trim() ?? ''
+
             if (!remainder) {
               return { cursor, value }
             }
@@ -198,20 +222,29 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
   )
 
   const handleTextPaste = useCallback(
-    ({ bracketed, cursor, hotkey, text, value }: PasteEvent): MaybePromise<null | { cursor: number; value: string }> => {
+    ({
+      bracketed,
+      cursor,
+      hotkey,
+      text,
+      value
+    }: PasteEvent): MaybePromise<null | { cursor: number; value: string }> => {
       if (hotkey) {
         const preferOsc52 = isRemoteShellSession(process.env)
+
         const readPreferredText = preferOsc52
           ? readOsc52Clipboard(querier).then(async osc52Text => {
               if (isUsableClipboardText(osc52Text)) {
                 return osc52Text
               }
+
               return readClipboardText()
             })
           : readClipboardText().then(async clipText => {
               if (isUsableClipboardText(clipText)) {
                 return clipText
               }
+
               return readOsc52Clipboard(querier)
             })
 
@@ -221,6 +254,7 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
           }
 
           void onClipboardPaste(false)
+
           return null
         })
       }
@@ -230,26 +264,36 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
     [handleResolvedPaste, onClipboardPaste, querier]
   )
 
-  const openEditor = useCallback(() => {
-    const editor = process.env.EDITOR || process.env.VISUAL || 'vi'
-    const file = join(mkdtempSync(join(tmpdir(), 'hermes-')), 'prompt.md')
+  const openEditor = useCallback(async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hermes-'))
+    const file = join(dir, 'prompt.md')
+    const [cmd, ...args] = resolveEditor()
 
     writeFileSync(file, [...inputBuf, input].join('\n'))
-    process.stdout.write('\x1b[?1049l')
-    const { status: code } = spawnSync(editor, [file], { stdio: 'inherit' })
-    process.stdout.write('\x1b[?1049h\x1b[2J\x1b[H')
 
-    if (code === 0) {
+    let exitCode: null | number = null
+
+    await withInkSuspended(async () => {
+      exitCode = spawnSync(cmd!, [...args, file], { stdio: 'inherit' }).status
+    })
+
+    try {
+      if (exitCode !== 0) {
+        return
+      }
+
       const text = readFileSync(file, 'utf8').trimEnd()
 
-      if (text) {
-        setInput('')
-        setInputBuf([])
-        submitRef.current(text)
+      if (!text) {
+        return
       }
-    }
 
-    rmSync(file, { force: true })
+      setInput('')
+      setInputBuf([])
+      submitRef.current(text)
+    } finally {
+      rmSync(dir, { force: true, recursive: true })
+    }
   }, [input, inputBuf, submitRef])
 
   const actions = useMemo(
@@ -260,6 +304,7 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
       handleTextPaste,
       openEditor,
       pushHistory,
+      removeQueue: removeQ,
       replaceQueue: replaceQ,
       setCompIdx,
       setHistoryIdx,
@@ -276,6 +321,7 @@ export function useComposerState({ gw, onClipboardPaste, onImageAttached, submit
       handleTextPaste,
       openEditor,
       pushHistory,
+      removeQ,
       replaceQ,
       setCompIdx,
       setHistoryIdx,
